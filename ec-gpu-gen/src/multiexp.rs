@@ -5,34 +5,22 @@ use std::sync::{Arc, RwLock};
 use ec_gpu::GpuEngine;
 use ff::PrimeField;
 use group::{prime::PrimeCurveAffine, Group};
-use log::{error, info, warn};
+use log::{error, info};
 use pairing::Engine;
-use rust_gpu_tools::{program_closures, Device, Program, Vendor, CUDA_CORES};
+use rust_gpu_tools::{program_closures, Device, Program, Vendor};
 use yastl::Scope;
 
 use crate::{
     error::{EcError, EcResult},
     program,
     threadpool::Worker,
+    utils::*,
     Limb32, Limb64,
 };
 
-const MAX_WINDOW_SIZE: usize = 10;
+// const MAX_WINDOW_SIZE: usize = 10;
 const LOCAL_WORK_SIZE: usize = 256;
-const MEMORY_PADDING: f64 = 0.2f64; // Let 20% of GPU memory be free
-const DEFAULT_CUDA_CORES: usize = 2560;
-
-fn get_cuda_cores_count(name: &str) -> usize {
-    *CUDA_CORES.get(name).unwrap_or_else(|| {
-        warn!(
-            "Number of CUDA cores for your device ({}) is unknown! Best performance is only \
-            achieved when the number of CUDA cores is known! You can find the instructions on \
-            how to support custom GPUs here: https://docs.rs/rust-gpu-tools",
-            name
-        );
-        &DEFAULT_CUDA_CORES
-    })
-}
+// const MEMORY_PADDING: f64 = 0.2f64; // Let 20% of GPU memory be free
 
 /// Multiexp kernel for a single GPU.
 pub struct SingleMultiexpKernel<'a, E>
@@ -42,6 +30,16 @@ where
     program: Program,
     core_count: usize,
     n: usize,
+
+    // custom define optimize gpu args
+    max_window_size: usize,
+    chunk_size_scale: usize,
+    best_chunk_size_scale: usize,
+    reserved_mem_ratio: f32,
+    chunk_divider_1: f64,
+    chunk_divider_2: f64,
+    chunk_divider_mod: usize,
+
     /// An optional function which will be called at places where it is possible to abort the
     /// multiexp calculations. If it returns true, the calculation will be aborted with an
     /// [`EcError::Aborted`].
@@ -55,7 +53,7 @@ fn calc_num_groups(core_count: usize, num_windows: usize) -> usize {
     2 * core_count / num_windows
 }
 
-fn calc_window_size(n: usize, exp_bits: usize, core_count: usize) -> usize {
+fn calc_window_size(n: usize, exp_bits: usize, core_count: usize, max_window_size: usize) -> usize {
     // window_size = ln(n / num_groups)
     // num_windows = exp_bits / window_size
     // num_groups = 2 * core_count / num_windows = 2 * core_count * window_size / exp_bits
@@ -64,36 +62,49 @@ fn calc_window_size(n: usize, exp_bits: usize, core_count: usize) -> usize {
     //
     // Thus we need to solve the following equation:
     // window_size + ln(window_size) = ln(exp_bits * n / (2 * core_count))
-    let lower_bound = (((exp_bits * n) as f64) / ((2 * core_count) as f64)).ln();
-    for w in 0..MAX_WINDOW_SIZE {
-        if (w as f64) + (w as f64).ln() > lower_bound {
-            return w;
-        }
-    }
+    // let lower_bound = (((exp_bits * n) as f64) / ((2 * core_count) as f64)).ln();
+    // for w in 0..MAX_WINDOW_SIZE {
+    //     if (w as f64) + (w as f64).ln() > lower_bound {
+    //         return w;
+    //     }
+    // }
 
-    MAX_WINDOW_SIZE
+    // MAX_WINDOW_SIZE
+
+    max_window_size
 }
 
-fn calc_best_chunk_size(max_window_size: usize, core_count: usize, exp_bits: usize) -> usize {
+fn calc_best_chunk_size(
+    max_window_size: usize,
+    core_count: usize,
+    exp_bits: usize,
+    scale: usize,
+) -> usize {
     // Best chunk-size (N) can also be calculated using the same logic as calc_window_size:
     // n = e^window_size * window_size * 2 * core_count / exp_bits
     (((max_window_size as f64).exp() as f64)
         * (max_window_size as f64)
-        * 2f64
+        * scale as f64
         * (core_count as f64)
         / (exp_bits as f64))
         .ceil() as usize
 }
 
-fn calc_chunk_size<E>(mem: u64, core_count: usize) -> usize
+fn calc_chunk_size<E>(
+    mem: u64,
+    core_count: usize,
+    scale: usize,
+    max_window_size: usize,
+    reserved_mem_ratio: f32,
+) -> usize
 where
     E: Engine,
 {
     let aff_size = std::mem::size_of::<E::G1Affine>() + std::mem::size_of::<E::G2Affine>();
     let exp_size = exp_size::<E>();
     let proj_size = std::mem::size_of::<E::G1>() + std::mem::size_of::<E::G2>();
-    ((((mem as f64) * (1f64 - MEMORY_PADDING)) as usize)
-        - (2 * core_count * ((1 << MAX_WINDOW_SIZE) + 1) * proj_size))
+    ((((mem as f64) * (1f64 - reserved_mem_ratio as f64)) as usize)
+        - (scale * core_count * ((1 << max_window_size) + 1) * proj_size))
         / (aff_size + exp_size)
 }
 
@@ -114,10 +125,27 @@ where
         maybe_abort: Option<&'a (dyn Fn() -> bool + Send + Sync)>,
     ) -> EcResult<Self> {
         let exp_bits = exp_size::<E>() * 8;
-        let core_count = get_cuda_cores_count(&device.name());
+        let core_count = get_cuda_cores_count(&device);
         let mem = device.memory();
-        let max_n = calc_chunk_size::<E>(mem, core_count);
-        let best_n = calc_best_chunk_size(MAX_WINDOW_SIZE, core_count, exp_bits);
+
+        // custom define
+        let chunk_divider_1 = get_chunk_divider_1(&device);
+        let chunk_divider_2 = get_chunk_divider_2(&device);
+        let chunk_divider_mod = get_chunk_divider_mod(&device);
+        let reserved_mem_ratio = get_reserved_mem_ratio(&device);
+        let max_window_size = get_max_window_size(&device);
+        let chunk_size_scale = get_chunk_size_scale(&device);
+        let best_chunk_size_scale = get_best_chunk_size_scale(&device);
+
+        let max_n = calc_chunk_size::<E>(
+            mem,
+            core_count,
+            chunk_size_scale,
+            max_window_size,
+            reserved_mem_ratio,
+        );
+        let best_n =
+            calc_best_chunk_size(max_window_size, core_count, exp_bits, best_chunk_size_scale);
         let n = std::cmp::min(max_n, best_n);
 
         let source = match device.vendor() {
@@ -129,6 +157,16 @@ where
         Ok(SingleMultiexpKernel {
             program,
             core_count,
+
+            // custom define
+            max_window_size,
+            chunk_size_scale,
+            best_chunk_size_scale,
+            reserved_mem_ratio,
+            chunk_divider_1,
+            chunk_divider_2,
+            chunk_divider_mod,
+
             n,
             maybe_abort,
             _phantom: std::marker::PhantomData,
@@ -152,7 +190,8 @@ where
         }
 
         let exp_bits = exp_size::<E>() * 8;
-        let window_size = calc_window_size(n as usize, exp_bits, self.core_count);
+        let window_size =
+            calc_window_size(n as usize, exp_bits, self.core_count, self.max_window_size);
         let num_windows = ((exp_bits as f64) / (window_size as f64)).ceil() as usize;
         let num_groups = calc_num_groups(self.core_count, num_windows);
         let bucket_len = 1 << window_size;

@@ -21,6 +21,7 @@ mod error;
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 mod program;
 mod source;
+mod utils;
 
 /// Fast Fourier Transform on the GPU.
 #[cfg(all(feature = "fft", any(feature = "cuda", feature = "opencl")))]
