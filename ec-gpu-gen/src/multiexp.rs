@@ -273,6 +273,11 @@ where
     }
 }
 
+/// type_of get type str name
+pub fn type_of<T>(_: &T) -> &str {
+    std::any::type_name::<T>()
+}
+
 /// A struct that containts several multiexp kernels for different devices.
 pub struct MultiexpKernel<'a, E>
 where
@@ -365,7 +370,39 @@ where
             let error = error.clone();
             scope.execute(move || {
                 let mut acc = <G as PrimeCurveAffine>::Curve::identity();
-                for (bases, exps) in bases.chunks(kern.n).zip(exps.chunks(kern.n)) {
+
+                let mut mem_limit = 0;
+                let mut jack_chunk = kern.n;
+                let size_result = std::mem::size_of::<<G as PrimeCurveAffine>::Curve>();
+
+                #[cfg(feature = "cuda")]
+                {
+                    mem_limit = kern.multiexp_chunk_size(bases, exps).expect("fail to get gpu memory limit");
+                    jack_chunk = std::cmp::min(kern.n, mem_limit);
+                }
+
+                #[cfg(not(feature = "cuda"))]
+                {
+                    if size_result > 144 {
+                        jack_chunk = (jack_chunk as f64 / kern.chunk_divider_1).ceil() as usize;
+                    } else {
+                        jack_chunk = (jack_chunk as f64 / kern.chunk_divider_2).ceil() as usize;
+                    }
+                }
+
+                let mut better_chunk = jack_chunk;
+                if chunk_size % jack_chunk != 0 {
+                    better_chunk = chunk_size / (chunk_size / jack_chunk + kern.chunk_divider_mod) + 1;
+                }
+
+                if better_chunk < jack_chunk {
+                    jack_chunk = better_chunk;
+                }
+
+                info!("jack chunk {} kernel n {} chunk size {} base size {} base type {} mem limit {} size_result {}",
+                    jack_chunk, kern.n, chunk_size, std::mem::size_of::<G>(), type_of(&bases[0]), mem_limit, size_result);
+
+                for (bases, exps) in bases.chunks(jack_chunk).zip(exps.chunks(jack_chunk)) {
                     if error.read().unwrap().is_err() {
                         break;
                     }
