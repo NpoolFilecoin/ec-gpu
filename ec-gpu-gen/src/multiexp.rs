@@ -111,7 +111,7 @@ where
         / (aff_size + exp_size)
     */
     ((((mem as f64) * (1f64 - reserved_mem_ratio as f64)) as usize)
-        - (scale * core_count * ((1 << max_window_size) + 1) * proj_size))
+        - ((scale as f64 * core_count as f64 * ((1 << max_window_size) + 1) as f64 * proj_size as f64) as usize))
         / (aff_size + exp_size)
 }
 
