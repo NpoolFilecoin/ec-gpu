@@ -25,8 +25,7 @@ use crate::{
 
 const MAX_WINDOW_SIZE: usize = 8;
 const LOCAL_WORK_SIZE: usize = 256;
-// const MEMORY_PADDING: f64 = 0.2f64; // Let 20% of GPU memory be free
-const MEMORY_PADDING: f64 = 0f64; // Let 20% of GPU memory be free
+const MEMORY_PADDING: f64 = 0.2f64; // Let 20% of GPU memory be free
 const DEFAULT_CUDA_CORES: usize = 2560;
 
 fn get_cuda_cores_count(name: &str) -> usize {
@@ -55,9 +54,6 @@ where
     maybe_abort: Option<&'a (dyn Fn() -> bool + Send + Sync)>,
 
     max_window_size: usize,
-    // chunk_size_scale: usize,
-    // best_chunk_size_scale: usize,
-    // reserved_mem_ratio: f32,
 
     _phantom: std::marker::PhantomData<E::Fr>,
 }
@@ -91,7 +87,7 @@ fn calc_window_size(n: usize, exp_bits: usize, core_count: usize, max_window_siz
     max_window_size
 }
 
-fn calc_best_chunk_size(max_window_size: usize, core_count: usize, exp_bits: usize, scale: usize) -> usize {
+fn calc_best_chunk_size(max_window_size: usize, core_count: usize, exp_bits: usize, scale: f32) -> usize {
     // Best chunk-size (N) can also be calculated using the same logic as calc_window_size:
     // n = e^window_size * window_size * 2 * core_count / exp_bits
     (((max_window_size as f64).exp() as f64)
@@ -102,7 +98,7 @@ fn calc_best_chunk_size(max_window_size: usize, core_count: usize, exp_bits: usi
         .ceil() as usize
 }
 
-fn calc_chunk_size<E>(mem: u64, core_count: usize, scale: usize, max_window_size: usize, reserved_mem_ratio: f32,) -> usize
+fn calc_chunk_size<E>(mem: u64, core_count: usize, scale: f32, max_window_size: usize, reserved_mem_ratio: f32,) -> usize
 where
     E: Engine,
 {
@@ -114,7 +110,7 @@ where
         - (2900 * core_count * ((1 << MAX_WINDOW_SIZE) + 1) * proj_size))
         / (aff_size + exp_size)
     */
-    ((((mem as f64) * (1f64 - reserved_mem_ration as f64)) as usize)
+    ((((mem as f64) * (1f64 - reserved_mem_ratio as f64)) as usize)
         - (scale * core_count * ((1 << max_window_size) + 1) * proj_size))
         / (aff_size + exp_size)
 }
@@ -197,7 +193,7 @@ where
         }
 
         let exp_bits = exp_size::<E>() * 8;
-        let window_size = calc_window_size(n as usize, exp_bits, self.core_count, kern.max_window_size);
+        let window_size = calc_window_size(n as usize, exp_bits, self.core_count, self.max_window_size);
         let num_windows = ((exp_bits as f64) / (window_size as f64)).ceil() as usize;
         let num_groups = calc_num_groups(self.core_count, num_windows);
         let bucket_len = 1 << window_size;
