@@ -15,11 +15,18 @@ use crate::{
     program,
     threadpool::Worker,
     Limb32, Limb64,
+    chunkconf::{
+        get_max_window_size,
+        get_chunk_size_scale,
+        get_best_chunk_size_scale,
+        get_reserved_mem_ratio,
+    },
 };
 
-const MAX_WINDOW_SIZE: usize = 10;
+const MAX_WINDOW_SIZE: usize = 8;
 const LOCAL_WORK_SIZE: usize = 256;
-const MEMORY_PADDING: f64 = 0.2f64; // Let 20% of GPU memory be free
+// const MEMORY_PADDING: f64 = 0.2f64; // Let 20% of GPU memory be free
+const MEMORY_PADDING: f64 = 0f64; // Let 20% of GPU memory be free
 const DEFAULT_CUDA_CORES: usize = 2560;
 
 fn get_cuda_cores_count(name: &str) -> usize {
@@ -47,6 +54,11 @@ where
     /// [`EcError::Aborted`].
     maybe_abort: Option<&'a (dyn Fn() -> bool + Send + Sync)>,
 
+    max_window_size: usize,
+    // chunk_size_scale: usize,
+    // best_chunk_size_scale: usize,
+    // reserved_mem_ratio: f32,
+
     _phantom: std::marker::PhantomData<E::Fr>,
 }
 
@@ -55,7 +67,7 @@ fn calc_num_groups(core_count: usize, num_windows: usize) -> usize {
     2 * core_count / num_windows
 }
 
-fn calc_window_size(n: usize, exp_bits: usize, core_count: usize) -> usize {
+fn calc_window_size(n: usize, exp_bits: usize, core_count: usize, max_window_size: usize) -> usize {
     // window_size = ln(n / num_groups)
     // num_windows = exp_bits / window_size
     // num_groups = 2 * core_count / num_windows = 2 * core_count * window_size / exp_bits
@@ -64,6 +76,8 @@ fn calc_window_size(n: usize, exp_bits: usize, core_count: usize) -> usize {
     //
     // Thus we need to solve the following equation:
     // window_size + ln(window_size) = ln(exp_bits * n / (2 * core_count))
+
+    /*
     let lower_bound = (((exp_bits * n) as f64) / ((2 * core_count) as f64)).ln();
     for w in 0..MAX_WINDOW_SIZE {
         if (w as f64) + (w as f64).ln() > lower_bound {
@@ -72,28 +86,36 @@ fn calc_window_size(n: usize, exp_bits: usize, core_count: usize) -> usize {
     }
 
     MAX_WINDOW_SIZE
+    */
+
+    max_window_size
 }
 
-fn calc_best_chunk_size(max_window_size: usize, core_count: usize, exp_bits: usize) -> usize {
+fn calc_best_chunk_size(max_window_size: usize, core_count: usize, exp_bits: usize, scale: usize) -> usize {
     // Best chunk-size (N) can also be calculated using the same logic as calc_window_size:
     // n = e^window_size * window_size * 2 * core_count / exp_bits
     (((max_window_size as f64).exp() as f64)
         * (max_window_size as f64)
-        * 2f64
+        * scale as f64
         * (core_count as f64)
         / (exp_bits as f64))
         .ceil() as usize
 }
 
-fn calc_chunk_size<E>(mem: u64, core_count: usize) -> usize
+fn calc_chunk_size<E>(mem: u64, core_count: usize, scale: usize, max_window_size: usize, reserved_mem_ratio: f32,) -> usize
 where
     E: Engine,
 {
     let aff_size = std::mem::size_of::<E::G1Affine>() + std::mem::size_of::<E::G2Affine>();
     let exp_size = exp_size::<E>();
     let proj_size = std::mem::size_of::<E::G1>() + std::mem::size_of::<E::G2>();
+    /*
     ((((mem as f64) * (1f64 - MEMORY_PADDING)) as usize)
-        - (2 * core_count * ((1 << MAX_WINDOW_SIZE) + 1) * proj_size))
+        - (2900 * core_count * ((1 << MAX_WINDOW_SIZE) + 1) * proj_size))
+        / (aff_size + exp_size)
+    */
+    ((((mem as f64) * (1f64 - reserved_mem_ration as f64)) as usize)
+        - (scale * core_count * ((1 << max_window_size) + 1) * proj_size))
         / (aff_size + exp_size)
 }
 
@@ -116,9 +138,31 @@ where
         let exp_bits = exp_size::<E>() * 8;
         let core_count = get_cuda_cores_count(&device.name());
         let mem = device.memory();
-        let max_n = calc_chunk_size::<E>(mem, core_count);
-        let best_n = calc_best_chunk_size(MAX_WINDOW_SIZE, core_count, exp_bits);
+        let max_window_size = get_max_window_size(device);
+        let max_n = calc_chunk_size::<E>(
+            mem,
+            core_count,
+            get_chunk_size_scale(device),
+            max_window_size,
+            get_reserved_mem_ratio(device),
+        );
+        let best_n = calc_best_chunk_size(
+            max_window_size,
+            core_count,
+            exp_bits,
+            get_best_chunk_size_scale(device),
+        );
         let n = std::cmp::min(max_n, best_n);
+        info!(
+            "SingleMultiexpKernel core_count {} max_n {} best_n {} n {} exp_bits {} max_window_size {} mem {}",
+            core_count,
+            max_n,
+            best_n,
+            n,
+            exp_bits,
+            get_max_window_size(device),
+            mem,
+        );
 
         let source = match device.vendor() {
             Vendor::Nvidia => crate::gen_source::<E, Limb32>(),
@@ -131,6 +175,7 @@ where
             core_count,
             n,
             maybe_abort,
+            max_window_size,
             _phantom: std::marker::PhantomData,
         })
     }
@@ -152,7 +197,7 @@ where
         }
 
         let exp_bits = exp_size::<E>() * 8;
-        let window_size = calc_window_size(n as usize, exp_bits, self.core_count);
+        let window_size = calc_window_size(n as usize, exp_bits, self.core_count, kern.max_window_size);
         let num_windows = ((exp_bits as f64) / (window_size as f64)).ceil() as usize;
         let num_groups = calc_num_groups(self.core_count, num_windows);
         let bucket_len = 1 << window_size;
@@ -234,6 +279,10 @@ where
     }
 }
 
+fn type_of<T>(_: &T) -> &str {
+    std::any::type_name::<T>()
+}
+
 /// A struct that containts several multiexp kernels for different devices.
 pub struct MultiexpKernel<'a, E>
 where
@@ -313,6 +362,7 @@ where
         let num_devices = self.kernels.len();
         let num_exps = exps.len();
         let chunk_size = ((num_exps as f64) / (num_devices as f64)).ceil() as usize;
+        let num_bases = bases.len();
 
         for (((bases, exps), kern), result) in bases
             .chunks(chunk_size)
@@ -330,6 +380,15 @@ where
                     if error.read().unwrap().is_err() {
                         break;
                     }
+                    info!(
+                        "kernel size {} chunk size {} base type {} base size {} total bases {} num bases {}",
+                        kern.n,
+                        chunk_size,
+                        type_of(&bases[0]),
+                        std::mem::size_of::<G>(),
+                        num_bases,
+                        bases.len(),
+                    );
                     match kern.multiexp(bases, exps, bases.len()) {
                         Ok(result) => acc.add_assign(&result),
                         Err(e) => {
