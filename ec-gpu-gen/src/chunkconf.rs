@@ -30,8 +30,8 @@ lazy_static::lazy_static! {
             ("Quadro M5000".to_string(), GPUInfo{max_window_size: 0, chunk_size_scale: 0.0, best_chunk_size_scale: 0.0, reserved_mem_ratio: 0.2}),
 
             ("GeForce RTX 3090".to_string(), GPUInfo{max_window_size: 9, chunk_size_scale: 90000.0, best_chunk_size_scale: 90000.0, reserved_mem_ratio: 0.05}),
-            ("GeForce RTX 3080".to_string(), GPUInfo{max_window_size: 8, chunk_size_scale: 2.0, best_chunk_size_scale: 2.0, reserved_mem_ratio: 0.2}),
-            ("NVIDIA GeForce RTX 3080".to_string(), GPUInfo{max_window_size: 8, chunk_size_scale: 2.0, best_chunk_size_scale: 2.0, reserved_mem_ratio: 0.2}),
+            ("GeForce RTX 3080".to_string(), GPUInfo{max_window_size: 8, chunk_size_scale: 40.0, best_chunk_size_scale: 40.0, reserved_mem_ratio: 0.0}),
+            ("NVIDIA GeForce RTX 3080".to_string(), GPUInfo{max_window_size: 8, chunk_size_scale: 40.0, best_chunk_size_scale: 40.0, reserved_mem_ratio: 0.0}),
             ("GeForce RTX 3080 Ti".to_string(), GPUInfo{max_window_size: 8, chunk_size_scale: 2.0, best_chunk_size_scale: 2.0, reserved_mem_ratio: 0.2}),
 
             ("GeForce RTX 3070".to_string(), GPUInfo{max_window_size: 0, chunk_size_scale: 0.0, best_chunk_size_scale: 0.0, reserved_mem_ratio: 0.2}),
