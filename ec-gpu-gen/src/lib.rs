@@ -47,6 +47,7 @@
 //! [fatbin]: https://en.wikipedia.org/wiki/Fat_binary#Heterogeneous_computing
 //! [feature flags]: https://doc.rust-lang.org/cargo/reference/manifest.html#the-features-section
 mod error;
+mod chunkconf;
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 mod program;
 mod source;

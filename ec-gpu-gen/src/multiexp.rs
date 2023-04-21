@@ -11,35 +11,30 @@ use yastl::Scope;
 use crate::{
     error::{EcError, EcResult},
     threadpool::Worker,
+    Limb32, Limb64,
+    chunkconf::{
+        get_max_window_size,
+        get_chunk_size_scale,
+        get_best_chunk_size_scale,
+        get_reserved_mem_ratio,
+    },
 };
 
-/// On the GPU, the exponents are split into windows, this is the maximum number of such windows.
-const MAX_WINDOW_SIZE: usize = 10;
-/// In CUDA this is the number of blocks per grid (grid size).
-const LOCAL_WORK_SIZE: usize = 128;
-/// Let 20% of GPU memory be free, this is an arbitrary value.
-const MEMORY_PADDING: f64 = 0.2f64;
-/// The Nvidia Ampere architecture is compute capability major version 8.
-const AMPERE: u32 = 8;
+const MAX_WINDOW_SIZE: usize = 8;
+const LOCAL_WORK_SIZE: usize = 256;
+const MEMORY_PADDING: f64 = 0.2f64; // Let 20% of GPU memory be free
+const DEFAULT_CUDA_CORES: usize = 2560;
 
-/// Divide and ceil to the next value.
-const fn div_ceil(a: usize, b: usize) -> usize {
-    if a % b == 0 {
-        a / b
-    } else {
-        (a / b) + 1
-    }
-}
-
-/// The number of units the work is split into. One unit will result in one CUDA thread.
-///
-/// Based on empirical results, it turns out that on Nvidia devices with the Ampere architecture,
-/// it's faster to use two times the number of work units.
-const fn work_units(compute_units: u32, compute_capabilities: Option<(u32, u32)>) -> usize {
-    match compute_capabilities {
-        Some((AMPERE, _)) => LOCAL_WORK_SIZE * compute_units as usize * 2,
-        _ => LOCAL_WORK_SIZE * compute_units as usize,
-    }
+fn get_cuda_cores_count(name: &str) -> usize {
+    *CUDA_CORES.get(name).unwrap_or_else(|| {
+        warn!(
+            "Number of CUDA cores for your device ({}) is unknown! Best performance is only \
+            achieved when the number of CUDA cores is known! You can find the instructions on \
+            how to support custom GPUs here: https://docs.rs/rust-gpu-tools",
+            name
+        );
+        &DEFAULT_CUDA_CORES
+    })
 }
 
 /// Multiexp kernel for a single GPU.
@@ -58,31 +53,67 @@ where
     /// [`EcError::Aborted`].
     maybe_abort: Option<&'a (dyn Fn() -> bool + Send + Sync)>,
 
-    _phantom: std::marker::PhantomData<G::Scalar>,
+    max_window_size: usize,
+
+    _phantom: std::marker::PhantomData<E::Fr>,
 }
 
-/// Calculates the maximum number of terms that can be put onto the GPU memory.
-fn calc_chunk_size<G>(mem: u64, work_units: usize) -> usize
+fn calc_num_groups(core_count: usize, num_windows: usize) -> usize {
+    // Observations show that we get the best performance when num_groups * num_windows ~= 2 * CUDA_CORES
+    2 * core_count / num_windows
+}
+
+fn calc_window_size(n: usize, exp_bits: usize, core_count: usize, max_window_size: usize) -> usize {
+    // window_size = ln(n / num_groups)
+    // num_windows = exp_bits / window_size
+    // num_groups = 2 * core_count / num_windows = 2 * core_count * window_size / exp_bits
+    // window_size = ln(n / num_groups) = ln(n * exp_bits / (2 * core_count * window_size))
+    // window_size = ln(exp_bits * n / (2 * core_count)) - ln(window_size)
+    //
+    // Thus we need to solve the following equation:
+    // window_size + ln(window_size) = ln(exp_bits * n / (2 * core_count))
+
+    /*
+    let lower_bound = (((exp_bits * n) as f64) / ((2 * core_count) as f64)).ln();
+    for w in 0..MAX_WINDOW_SIZE {
+        if (w as f64) + (w as f64).ln() > lower_bound {
+            return w;
+        }
+    }
+
+    MAX_WINDOW_SIZE
+    */
+
+    max_window_size
+}
+
+fn calc_best_chunk_size(max_window_size: usize, core_count: usize, exp_bits: usize, scale: f32) -> usize {
+    // Best chunk-size (N) can also be calculated using the same logic as calc_window_size:
+    // n = e^window_size * window_size * 2 * core_count / exp_bits
+    (((max_window_size as f64).exp() as f64)
+        * (max_window_size as f64)
+        * scale as f64
+        * (core_count as f64)
+        / (exp_bits as f64))
+        .ceil() as usize
+}
+
+fn calc_chunk_size<E>(mem: u64, core_count: usize, scale: f32, max_window_size: usize, reserved_mem_ratio: f32,) -> usize
 where
     G: PrimeCurveAffine,
     G::Scalar: PrimeField,
 {
-    let aff_size = std::mem::size_of::<G>();
-    let exp_size = exp_size::<G::Scalar>();
-    let proj_size = std::mem::size_of::<G::Curve>();
-
-    // Leave `MEMORY_PADDING` percent of the memory free.
-    let max_memory = ((mem as f64) * (1f64 - MEMORY_PADDING)) as usize;
-    // The amount of memory (in bytes) of a single term.
-    let term_size = aff_size + exp_size;
-    // The number of buckets needed for one work unit
-    let max_buckets_per_work_unit = 1 << MAX_WINDOW_SIZE;
-    // The amount of memory (in bytes) we need for the intermediate steps (buckets).
-    let buckets_size = work_units * max_buckets_per_work_unit * proj_size;
-    // The amount of memory (in bytes) we need for the results.
-    let results_size = work_units * proj_size;
-
-    (max_memory - buckets_size - results_size) / term_size
+    let aff_size = std::mem::size_of::<E::G1Affine>() + std::mem::size_of::<E::G2Affine>();
+    let exp_size = exp_size::<E>();
+    let proj_size = std::mem::size_of::<E::G1>() + std::mem::size_of::<E::G2>();
+    /*
+    ((((mem as f64) * (1f64 - MEMORY_PADDING)) as usize)
+        - (2900 * core_count * ((1 << MAX_WINDOW_SIZE) + 1) * proj_size))
+        / (aff_size + exp_size)
+    */
+    ((((mem as f64) * (1f64 - reserved_mem_ratio as f64)) as usize)
+        - ((scale as f64 * core_count as f64 * ((1 << max_window_size) + 1) as f64 * proj_size as f64) as usize))
+        / (aff_size + exp_size)
 }
 
 /// The size of the exponent in bytes.
@@ -106,16 +137,44 @@ where
         maybe_abort: Option<&'a (dyn Fn() -> bool + Send + Sync)>,
     ) -> EcResult<Self> {
         let mem = device.memory();
-        let compute_units = device.compute_units();
-        let compute_capability = device.compute_capability();
-        let work_units = work_units(compute_units, compute_capability);
-        let chunk_size = calc_chunk_size::<G>(mem, work_units);
+        let max_window_size = get_max_window_size(device);
+        let max_n = calc_chunk_size::<E>(
+            mem,
+            core_count,
+            get_chunk_size_scale(device),
+            max_window_size,
+            get_reserved_mem_ratio(device),
+        );
+        let best_n = calc_best_chunk_size(
+            max_window_size,
+            core_count,
+            exp_bits,
+            get_best_chunk_size_scale(device),
+        );
+        let n = std::cmp::min(max_n, best_n);
+        info!(
+            "SingleMultiexpKernel core_count {} max_n {} best_n {} n {} exp_bits {} max_window_size {} mem {}",
+            core_count,
+            max_n,
+            best_n,
+            n,
+            exp_bits,
+            get_max_window_size(device),
+            mem,
+        );
+
+        let source = match device.vendor() {
+            Vendor::Nvidia => crate::gen_source::<E, Limb32>(),
+            _ => crate::gen_source::<E, Limb64>(),
+        };
+        let program = program::program::<E>(device, &source)?;
 
         Ok(SingleMultiexpKernel {
             program,
             n: chunk_size,
             work_units,
             maybe_abort,
+            max_window_size,
             _phantom: std::marker::PhantomData,
         })
     }
@@ -137,10 +196,11 @@ where
                 return Err(EcError::Aborted);
             }
         }
-        let window_size = self.calc_window_size(bases.len());
-        // windows_size * num_windows needs to be >= 256 in order for the kernel to work correctly.
-        let num_windows = div_ceil(256, window_size);
-        let num_groups = self.work_units / num_windows;
+
+        let exp_bits = exp_size::<E>() * 8;
+        let window_size = calc_window_size(n as usize, exp_bits, self.core_count, self.max_window_size);
+        let num_windows = ((exp_bits as f64) / (window_size as f64)).ceil() as usize;
+        let num_groups = calc_num_groups(self.core_count, num_windows);
         let bucket_len = 1 << window_size;
 
         // Each group will have `num_windows` threads and as there are `num_groups` groups, there will
@@ -214,6 +274,10 @@ where
         let window_size = ((div_ceil(num_terms, self.work_units) as f64).log2() as usize) + 2;
         std::cmp::min(window_size, MAX_WINDOW_SIZE)
     }
+}
+
+fn type_of<T>(_: &T) -> &str {
+    std::any::type_name::<T>()
 }
 
 /// A struct that containts several multiexp kernels for different devices.
@@ -297,6 +361,7 @@ where
         let num_exps = exps.len();
         // The maximum number of exponentiations per device.
         let chunk_size = ((num_exps as f64) / (num_devices as f64)).ceil() as usize;
+        let num_bases = bases.len();
 
         for (((bases, exps), kern), result) in bases
             .chunks(chunk_size)
@@ -314,6 +379,15 @@ where
                     if error.read().unwrap().is_err() {
                         break;
                     }
+                    info!(
+                        "kernel size {} chunk size {} base type {} base size {} total bases {} num bases {}",
+                        kern.n,
+                        chunk_size,
+                        type_of(&bases[0]),
+                        std::mem::size_of::<G>(),
+                        num_bases,
+                        bases.len(),
+                    );
                     match kern.multiexp(bases, exps) {
                         Ok(result) => acc.add_assign(&result),
                         Err(e) => {
